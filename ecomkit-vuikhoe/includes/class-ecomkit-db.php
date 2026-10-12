@@ -54,7 +54,11 @@ final class Ecomkit_Vuikhoe_DB {
 		if ( $before['tables_ok'] ) {
 			self::migrate_tables_to_innodb();
 			self::migrate_orders_contract();
+			self::migrate_connection_order_index();
 			self::migrate_provider_evidence_columns();
+			self::migrate_canonical_result_columns();
+			self::migrate_payment_columns();
+			self::migrate_income_columns();
 		}
 		$collate = $wpdb->get_charset_collate();
 		$sql     = self::schema_sql( $tables, $collate );
@@ -70,6 +74,7 @@ final class Ecomkit_Vuikhoe_DB {
 		}
 
 		self::migrate_tables_to_innodb();
+		self::migrate_connection_order_index();
 		if ( ! self::database_runtime_diagnostic()['ready'] ) {
 			update_option( self::INSTALL_ERROR_OPTION, 'ECOMKIT_DB_INNODB_MIGRATION_FAILED', false );
 			throw new RuntimeException( 'ECOMKIT_DB_INNODB_MIGRATION_FAILED' );
@@ -81,6 +86,18 @@ final class Ecomkit_Vuikhoe_DB {
 		if ( ! self::provider_evidence_schema_ready() ) {
 			update_option( self::INSTALL_ERROR_OPTION, 'ECOMKIT_PROVIDER_SCHEMA_INCOMPATIBLE', false );
 			throw new RuntimeException( 'ECOMKIT_PROVIDER_SCHEMA_INCOMPATIBLE' );
+		}
+		if ( ! self::canonical_result_schema_ready() ) {
+			update_option( self::INSTALL_ERROR_OPTION, 'ECOMKIT_CANONICAL_SCHEMA_INCOMPATIBLE', false );
+			throw new RuntimeException( 'ECOMKIT_CANONICAL_SCHEMA_INCOMPATIBLE' );
+		}
+		if ( ! self::payment_schema_ready() ) {
+			update_option( self::INSTALL_ERROR_OPTION, 'ECOMKIT_PAYMENT_SCHEMA_INCOMPATIBLE', false );
+			throw new RuntimeException( 'ECOMKIT_PAYMENT_SCHEMA_INCOMPATIBLE' );
+		}
+		if ( ! self::income_schema_ready() ) {
+			update_option( self::INSTALL_ERROR_OPTION, 'ECOMKIT_INCOME_SCHEMA_INCOMPATIBLE', false );
+			throw new RuntimeException( 'ECOMKIT_INCOME_SCHEMA_INCOMPATIBLE' );
 		}
 
 		update_option( self::SCHEMA_OPTION, ECOMKIT_VUIKHOE_DB_VERSION, false );
@@ -249,6 +266,29 @@ final class Ecomkit_Vuikhoe_DB {
 		return array( 'altered' => $altered, 'counts' => $after );
 	}
 
+	/** Preserve historical re-import rows while making shop/order uniqueness Batch-scoped. */
+	public static function migrate_connection_order_index(): bool {
+		global $wpdb;
+		$tables = self::table_names();
+		$orders = self::safe_table_identifier( $tables['orders'], $tables );
+		$indexes = $wpdb->get_results( "SHOW INDEX FROM `$orders`", ARRAY_A );
+		$parts = array();
+		foreach ( is_array( $indexes ) ? $indexes : array() as $index ) {
+			if ( 'connection_order' === (string) ( $index['Key_name'] ?? '' ) ) { $parts[ (int) ( $index['Seq_in_index'] ?? 0 ) ] = (string) ( $index['Column_name'] ?? '' ); }
+		}
+		ksort( $parts );
+		if ( array_values( $parts ) === array( 'batch_id', 'connection_id', 'marketplace_order_id' ) ) { return false; }
+		if ( array_values( $parts ) !== array( 'connection_id', 'marketplace_order_id' ) ) { throw new RuntimeException( 'ECOMKIT_CONNECTION_ORDER_INDEX_UNEXPECTED' ); }
+		$before = (int) $wpdb->get_var( "SELECT COUNT(*) FROM `$orders`" );
+		if ( false === $wpdb->query( "ALTER TABLE `$orders` DROP INDEX `connection_order`, ADD UNIQUE KEY `connection_order` (`batch_id`,`connection_id`,`marketplace_order_id`)" ) ) { throw new RuntimeException( 'ECOMKIT_CONNECTION_ORDER_INDEX_MIGRATION_FAILED' ); }
+		$after = $wpdb->get_results( "SHOW INDEX FROM `$orders`", ARRAY_A );
+		$columns = array();
+		foreach ( is_array( $after ) ? $after : array() as $index ) { if ( 'connection_order' === (string) ( $index['Key_name'] ?? '' ) ) { $columns[ (int) ( $index['Seq_in_index'] ?? 0 ) ] = (string) ( $index['Column_name'] ?? '' ); } }
+		ksort( $columns );
+		if ( array_values( $columns ) !== array( 'batch_id', 'connection_id', 'marketplace_order_id' ) || $before !== (int) $wpdb->get_var( "SELECT COUNT(*) FROM `$orders`" ) ) { throw new RuntimeException( 'ECOMKIT_CONNECTION_ORDER_INDEX_VERIFY_FAILED' ); }
+		return true;
+	}
+
 	/**
 	 * Adds WP.5 provider evidence columns without replacing the Orders table.
 	 * Existing row counts and indexes are verified before the schema version advances.
@@ -311,6 +351,85 @@ final class Ecomkit_Vuikhoe_DB {
 			if ( ! isset( $columns[ $name ] ) || 'YES' !== strtoupper( (string) ( $columns[ $name ]['Null'] ?? '' ) ) ) {
 				return false;
 			}
+		}
+		return true;
+	}
+
+	/** Adds only nullable WP.6 metadata around the existing canonical_data snapshot. */
+	public static function migrate_canonical_result_columns(): array {
+		global $wpdb;
+		$tables = self::table_names(); $orders = self::safe_table_identifier( $tables['orders'], $tables );
+		$before_count = (int) $wpdb->get_var( "SELECT COUNT(*) FROM `$orders`" );
+		$indexes_before = self::table_index_fingerprint( $orders );
+		$definitions = array( 'canonical_result_version' => 'varchar(16) NULL DEFAULT NULL', 'canonical_materialized_at' => 'datetime NULL DEFAULT NULL', 'canonical_source_fingerprint' => 'varchar(64) NULL DEFAULT NULL' );
+		$columns = self::orders_columns(); $added = array();
+		foreach ( $definitions as $name => $definition ) {
+			if ( isset( $columns[ $name ] ) ) { continue; }
+			if ( false === $wpdb->query( "ALTER TABLE `$orders` ADD COLUMN `$name` $definition" ) ) { throw new RuntimeException( 'ECOMKIT_CANONICAL_SCHEMA_ALTER_FAILED_' . strtoupper( $name ) ); }
+			$added[] = $name; $columns = self::orders_columns();
+			if ( ! isset( $columns[ $name ] ) || 'YES' !== strtoupper( (string) ( $columns[ $name ]['Null'] ?? '' ) ) ) { throw new RuntimeException( 'ECOMKIT_CANONICAL_SCHEMA_VERIFY_FAILED_' . strtoupper( $name ) ); }
+		}
+		if ( $before_count !== (int) $wpdb->get_var( "SELECT COUNT(*) FROM `$orders`" ) ) { throw new RuntimeException( 'ECOMKIT_CANONICAL_SCHEMA_ROW_COUNT_MISMATCH' ); }
+		if ( $indexes_before !== self::table_index_fingerprint( $orders ) ) { throw new RuntimeException( 'ECOMKIT_CANONICAL_SCHEMA_INDEX_MISMATCH' ); }
+		return array( 'added' => $added, 'count' => $before_count );
+	}
+
+	public static function canonical_result_schema_ready(): bool {
+		$columns = self::orders_columns();
+		foreach ( array( 'canonical_data', 'canonical_result_version', 'canonical_materialized_at', 'canonical_source_fingerprint' ) as $name ) {
+			if ( ! isset( $columns[ $name ] ) || 'YES' !== strtoupper( (string) ( $columns[ $name ]['Null'] ?? '' ) ) ) { return false; }
+		}
+		return true;
+	}
+
+	/** Nullable, additive WP.6B accounting snapshot; preserves existing rows and indexes. */
+	public static function migrate_payment_columns(): array {
+		global $wpdb;
+		$tables = self::table_names(); $orders = self::safe_table_identifier( $tables['orders'], $tables );
+		$before = (int) $wpdb->get_var( "SELECT COUNT(*) FROM `$orders`" );
+		$indexes = self::table_index_fingerprint( $orders );
+		$definitions = array( 'payment_raw_data' => 'longtext NULL DEFAULT NULL', 'payment_normalized_data' => 'longtext NULL DEFAULT NULL', 'payment_fetched_at' => 'datetime NULL DEFAULT NULL', 'payment_request_id' => 'varchar(191) NULL DEFAULT NULL' );
+		$columns = self::orders_columns(); $added = array();
+		foreach ( $definitions as $name => $definition ) {
+			if ( isset( $columns[ $name ] ) ) { continue; }
+			if ( false === $wpdb->query( "ALTER TABLE `$orders` ADD COLUMN `$name` $definition" ) ) { throw new RuntimeException( 'ECOMKIT_PAYMENT_SCHEMA_ALTER_FAILED' ); }
+			$added[] = $name; $columns = self::orders_columns();
+			if ( ! isset( $columns[ $name ] ) || 'YES' !== strtoupper( (string) ( $columns[ $name ]['Null'] ?? '' ) ) ) { throw new RuntimeException( 'ECOMKIT_PAYMENT_SCHEMA_VERIFY_FAILED' ); }
+		}
+		if ( $before !== (int) $wpdb->get_var( "SELECT COUNT(*) FROM `$orders`" ) || $indexes !== self::table_index_fingerprint( $orders ) ) { throw new RuntimeException( 'ECOMKIT_PAYMENT_SCHEMA_PRESERVATION_FAILED' ); }
+		return array( 'added' => $added, 'count' => $before );
+	}
+
+	public static function payment_schema_ready(): bool {
+		$columns = self::orders_columns();
+		foreach ( array( 'payment_raw_data', 'payment_normalized_data', 'payment_fetched_at', 'payment_request_id' ) as $name ) {
+			if ( ! isset( $columns[ $name ] ) || 'YES' !== strtoupper( (string) ( $columns[ $name ]['Null'] ?? '' ) ) ) { return false; }
+		}
+		return true;
+	}
+
+	/** Nullable, additive WP.6D income snapshot migration. */
+	public static function migrate_income_columns(): array {
+		global $wpdb;
+		$tables = self::table_names(); $orders = self::safe_table_identifier( $tables['orders'], $tables );
+		$before = (int) $wpdb->get_var( "SELECT COUNT(*) FROM `$orders`" );
+		$indexes = self::table_index_fingerprint( $orders );
+		$definitions = array( 'income_raw_data' => 'longtext NULL DEFAULT NULL', 'income_normalized_data' => 'longtext NULL DEFAULT NULL', 'income_fetched_at' => 'datetime NULL DEFAULT NULL', 'income_request_id' => 'varchar(191) NULL DEFAULT NULL' );
+		$columns = self::orders_columns(); $added = array();
+		foreach ( $definitions as $name => $definition ) {
+			if ( isset( $columns[ $name ] ) ) { continue; }
+			if ( false === $wpdb->query( "ALTER TABLE `$orders` ADD COLUMN `$name` $definition" ) ) { throw new RuntimeException( 'ECOMKIT_INCOME_SCHEMA_ALTER_FAILED' ); }
+			$added[] = $name; $columns = self::orders_columns();
+			if ( ! isset( $columns[ $name ] ) || 'YES' !== strtoupper( (string) ( $columns[ $name ]['Null'] ?? '' ) ) ) { throw new RuntimeException( 'ECOMKIT_INCOME_SCHEMA_VERIFY_FAILED' ); }
+		}
+		if ( $before !== (int) $wpdb->get_var( "SELECT COUNT(*) FROM `$orders`" ) || $indexes !== self::table_index_fingerprint( $orders ) ) { throw new RuntimeException( 'ECOMKIT_INCOME_SCHEMA_PRESERVATION_FAILED' ); }
+		return array( 'added' => $added, 'count' => $before );
+	}
+
+	public static function income_schema_ready(): bool {
+		$columns = self::orders_columns();
+		foreach ( array( 'income_raw_data', 'income_normalized_data', 'income_fetched_at', 'income_request_id' ) as $name ) {
+			if ( ! isset( $columns[ $name ] ) || 'YES' !== strtoupper( (string) ( $columns[ $name ]['Null'] ?? '' ) ) ) { return false; }
 		}
 		return true;
 	}
@@ -521,16 +640,27 @@ final class Ecomkit_Vuikhoe_DB {
 	transaction_platform_fee decimal(20,4) DEFAULT NULL,
 	platform_cost_percent decimal(9,4) DEFAULT NULL,
 	canonical_data longtext DEFAULT NULL,
+	canonical_result_version varchar(16) DEFAULT NULL,
+	canonical_materialized_at datetime DEFAULT NULL,
+	canonical_source_fingerprint varchar(64) DEFAULT NULL,
 	raw_source_metadata longtext DEFAULT NULL,
 	provider_raw_data longtext DEFAULT NULL,
 	provider_normalized_data longtext DEFAULT NULL,
 	provider_updated_at datetime DEFAULT NULL,
+	payment_raw_data longtext DEFAULT NULL,
+	payment_normalized_data longtext DEFAULT NULL,
+	payment_fetched_at datetime DEFAULT NULL,
+	payment_request_id varchar(191) DEFAULT NULL,
+	income_raw_data longtext DEFAULT NULL,
+	income_normalized_data longtext DEFAULT NULL,
+	income_fetched_at datetime DEFAULT NULL,
+	income_request_id varchar(191) DEFAULT NULL,
 	matched_at datetime DEFAULT NULL,
 	source_refs longtext DEFAULT NULL,
 	created_at datetime NOT NULL,
 	updated_at datetime NOT NULL,
 	PRIMARY KEY  (id),
-	UNIQUE KEY connection_order (connection_id,marketplace_order_id),
+	UNIQUE KEY connection_order (batch_id,connection_id,marketplace_order_id),
 	KEY batch_id (batch_id),
 	KEY normalized_order_code (normalized_order_code),
 	KEY matching_status (matching_status),

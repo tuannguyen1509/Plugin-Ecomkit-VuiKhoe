@@ -1,5 +1,9 @@
 # Tích hợp Shopee
 
+## WP.6 Result materialization
+
+WP.6A không gọi Shopee. Nó chỉ đọc `provider_normalized_data` do WP.5 đã persist. Canonical v2 dùng `providerCreatedAt` chỉ khi Excel `order_date` NULL; recipient dùng `recipientName`, `recipientPhone`, `recipientFullAddress` và `recipientState > recipientCity > recipientRegion` cho Order `MATCHED`. `NOT_FOUND_IN_SHOPEE`, `DETAIL_MISSING` và Lazada giữ các giá trị provider là NULL. `CANCELLED` vẫn là một Order `MATCHED` và không bị loại.
+
 ## 1. Trạng thái WP.3
 
 Plugin WordPress đã có provider config, signer, OAuth start/callback, token exchange và encrypted MarketplaceConnection. Live authorization vẫn là `VALIDATION_PENDING`; automated tests không thay thế Shopee Console và shop authorization thật. WP.3 không triển khai Order API, escrow hoặc refresh execution.
@@ -117,6 +121,12 @@ The default admin test accepts one date and converts its WordPress-timezone boun
 
 ## WP.5 — Excel-derived exact reconciliation
 
+## WP.6B — Payment/Escrow one-order POST
+
+Ecomkit dùng `POST /api/v2/payment/get_escrow_detail` tại environment host hiện có, `Content-Type: application/json`, body `{"order_sn":"<marketplace_order_id>"}`. Common shop auth `partner_id`, `timestamp`, `access_token`, `shop_id`, `sign` nằm ở query; signature base giữ nguyên và không chứa body/order_sn. Token lấy qua `ensure_usable_access_token()`. Chỉ admin click cho một Order Shopee MATCHED mới gọi provider; không retry, không GET fallback. Nếu live shop từ chối method/contract, ghi classification an toàn để xác minh lại; nếu thiếu permission, báo external permission. Payment snapshot tách riêng và không map canonical trong WP.6B.
+
+WP.6C sử dụng lại single-order POST đã được live xác nhận để enrich Batch: chỉ `platform=SHOPEE`, `matching_status=MATCHED`, đúng `marketplace_order_id`, tối đa một Payment call cho mỗi Order đủ điều kiện. Mặc định snapshot hợp lệ được tái sử dụng; admin có thể chủ động refresh. Sau mỗi lượt, canonical v3 materialize từ Payment normalized data đã persist, không cần provider call riêng. `commissionFee`, `serviceFee`, `sellerTransactionFee` map trực tiếp; `escrowAmountAfterAdjustment` ưu tiên `escrowAmount`. Không lấy `buyerTotalAmount` làm seller receivable, không map affiliate Shopee thành affiliate Vui Khỏe.
+
 - Input is an existing `SUCCESS`/`WARNING` Excel Batch; only rows with `platform=SHOPEE` participate. LAZADA rows are never changed.
 - The query plan comes from the Excel `Ngày đặt` value in WordPress timezone. Consecutive local days are grouped, each window is at most 15 days, and list calls use `time_range_field=create_time`. There is no manual date/order-ID input and no unbounded history scan.
 - Every window uses `get_all_orders()`, opaque provider cursors, exact `order_sn` deduplication and the existing 100-page stall/cycle guard. Negative evidence is valid only after a window completes.
@@ -125,3 +135,14 @@ The default admin test accepts one date and converts its WordPress-timezone boun
 - The validated per-order detail object is stored in `provider_raw_data`; a pure deterministic neutral projection is stored in `provider_normalized_data`. `provider_updated_at` protects against stale overwrite and `matched_at` records reconciliation evidence time. Excel `raw_source_metadata` remains unchanged.
 - One READY connection is selected automatically. Multiple READY shops require an explicit administrator selection; provider evidence is bound through `connection_id` to that shop.
 - WP.5 performs zero automatic retries, no Payment/Escrow request, no Lazada API call and no SyncRun creation. A controlled token refresh may still occur inside `ensure_usable_access_token()`.
+# WP.6D Income Status validation
+
+Ecomkit dùng `POST /api/v2/payment/get_income_detail` với JSON `cursor`, `date_from`, `date_to`, `income_status`, `page_size`; shop auth vẫn nằm trên query và signer cũ. Local Shop: 1=RELEASED, 2=PENDING; không gửi 0. RELEASED yêu cầu `date_to` sau `date_from`, tối đa 14 ngày payout date. PENDING gửi ngày hợp lệ theo schema nhưng **không** được lọc bởi ngày. `page_size=30` theo ví dụ schema (không giả định 100 hợp lệ). Response `income_detail_list.list` và `next_page.cursor`; empty cursor mới kết thúc. Chỉ so `order_sn` exact với marketplace ID, không dùng eShop ID. Diagnostic duyệt nhiều nhất 10 trang/click; incomplete/network/provider error không được kết luận vắng đơn. Snapshot Income tách biệt; canonical mapping kế toán còn chờ phê duyệt sau live VN shop validation.
+
+WP.6E chấp nhận riêng envelope live hợp lệ `HTTP 200`, `error:""`, `response:null` là `SHOPEE_INCOME_EMPTY`; JSON lỗi, thiếu contract hay `response` sai kiểu vẫn invalid. Danh sách hợp lệ được kiểm tra nghiêm ngặt ở top-level `income_detail_list` hoặc `response.income_detail_list`, không suy từ key khác. Pipeline tự truy vấn PENDING (ngày chỉ là field bắt buộc, không lọc), rồi tối đa sáu cửa sổ RELEASED liên tiếp, mỗi cửa sổ 14 ngày, mới nhất trước. Mỗi page/list quét **một lần cho cả Batch**, index bằng exact `order_sn`, không truy vấn cùng cửa sổ cho từng Order. Tối đa 10 pages/window; query chưa duyệt hết không bị gọi là NOT_FOUND. Income là best-effort; Payment snapshot/canonical v3 vẫn tạo Result nếu Income trống hoặc lỗi.
+# WP.6H.1A — Chẩn đoán nguồn phí Shopee
+
+Kết quả → Chẩn đoán nâng cao có công cụ admin-only, read-only `Kiểm tra nguồn phí Shopee` và `Xuất JSON chẩn đoán phí` cho Payment snapshot đã persist. Lookup exact `orders.marketplace_order_id` trong Batch, không dùng eShop code. Output chỉ là numeric financial path và normalized financial allowlist, tìm giá trị đúng `5700`, nêu trace hiện hành `payment_raw_data.order_income.service_fee → serviceFee → Phí dịch vụ (TMĐT)`. Không trả raw JSON đầy đủ/PII/secret; không gọi Shopee hoặc đổi mapping. Hai đơn legacy làm parity của service fee cần review; chỉ WP.6H.2 sau khi xem evidence mới được sửa mapping.
+# WP.6H.2 — service-fee accounting parity
+
+`order_income.service_fee` là phí provider, được giữ nguyên trong raw và normalized `serviceFee`. PiShip `order_income.shipping_seller_protection_fee_amount` được normalized riêng thành `shippingSellerProtectionFeeAmount`. Canonical v6 tính phí dịch vụ legacy Shopee từ hai trường đó trừ `orders.discount_vuikhoe` (Excel nội bộ); không dùng voucher/affiliate Shopee. Snapshot cũ thiếu normalized PiShip đọc raw Payment đã lưu và kiểm tra `order_sn` chính xác, không Payment refetch. Thiếu nguồn hoặc kết quả âm không tự suy đoán. Phí đã hiệu chỉnh nuôi các công thức legacy; Escrow vẫn ưu tiên cho Tổng Tiền Sẽ Thu.

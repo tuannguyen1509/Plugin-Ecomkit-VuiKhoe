@@ -1,5 +1,9 @@
 # Bảo mật
 
+## WP.6 canonical Result
+
+Materialization là POST admin-only (`manage_options`) với nonce và PRG, chỉ đọc dữ liệu đã persist và không gọi network/token/Payment/Escrow. Tên, SĐT và địa chỉ source-backed được phép trong bảng Result admin và luôn HTML-escape; không được ghi log, diagnostic, error, transient, public REST hay frontend. Raw Excel/provider JSON không hiển thị.
+
 ## 1. Mô hình quyền WordPress
 
 - Mọi admin page và REST mutation phải kiểm tra capability phía server; ẩn nút UI không phải authorization.
@@ -105,6 +109,10 @@ OAuth failure details are stored for at most ten minutes in a one-time transient
 
 # WP.4A refresh safety
 
+WP.6B Payment test chỉ dành cho admin có capability và nonce, nhận Order ID đã MATCHED từ Batch thay vì order_sn tùy ý. Signed URL, token, Partner Key và Payment raw JSON không xuất hiện trong diagnostics/transient/HTML; chỉ summary tài chính và key/type shape được hiển thị. Persisted raw Payment chỉ giữ `order_sn` và `order_income`, tách khỏi Order Detail và canonical. Một click có tối đa một Payment POST, không tự thử GET khi method bị từ chối.
+
+WP.6C Batch action cũng chỉ dành cho admin và có nonce. Nó chỉ chọn các Order Excel Shopee MATCHED có marketplace ID/connection; tối đa một Payment POST mỗi Order trong một lượt, không retry, không gọi Lazada/extra provider Orders. Summary chỉ giữ count, Order ID nội bộ và classification lỗi; không có raw Payment, PII hay credential. Lỗi một Order không làm mất Payment snapshot cũ hoặc thay đổi Excel/Order Detail.
+
 Shopee refresh tokens are treated as rotating single-use state. The refresh endpoint is never retried automatically. Network/timeout ambiguity, or encryption/persistence failure after provider success, moves the safe lifecycle toward `REFRESH_UNCERTAIN` and requires reauthorization while preserving old ciphertext. Definitive expired/invalid refresh authorization becomes `REAUTH_REQUIRED`. Tokens appear only in encrypted envelopes and ephemeral server-side memory, never in URLs, HTML, diagnostics, logs, or options plaintext.
 
 # WP.4B Order API security
@@ -121,3 +129,14 @@ The validated individual Order Detail object may contain recipient PII and is st
 
 No network transaction spans a DB transaction. Failed/incomplete pagination cannot produce negative match evidence. Older provider snapshots cannot overwrite newer `provider_updated_at`; absent provider timestamps use the conservative rule that an existing snapshot is retained. Payment/Escrow is not called and financial settlement is not inferred.
 
+# WP.6D Income diagnostic
+
+Chỉ admin có quyền quản lý và nonce hợp lệ mới chọn được một Order Shopee MATCHED từ Batch. Income POST tái sử dụng token lifecycle và shop signer; không ký body hay log token/URL/body. Tối đa 10 trang, không retry, không GET fallback. Lưu raw record đã giảm thiểu, không lưu buyer PII; thông báo lỗi chỉ gồm classification, status, path, method, request ID và tên key/type an toàn. Quyền API bị từ chối được phân loại `MANUAL_BLOCKED_EXTERNAL_PERMISSION`; traversal chưa hết không bị gọi là NOT_FOUND.
+
+WP.6E tự động chạy qua WP-Cron sau import của admin đã xác thực; không cho phép nhập order_sn/ngày tự do trong luồng bình thường. Lock và `auto_pipeline` metadata ngăn chạy trùng Batch; trạng thái `inflight` được lưu trước provider call để resume không lặp call có kết quả không rõ. Các mã cảnh báo an toàn không chứa token, signed URL, raw financial payload hay PII. Nút resume/chẩn đoán thủ công vẫn yêu cầu capability và nonce.
+# WP.6G — Internal Excel source safety
+
+Năm header nội bộ là tùy chọn, exact-match sau chuẩn hóa whitespace; không fuzzy-map với Shopee provider. Giá trị tiền không hợp lệ tạo warning có file/sheet/row/field và giữ `NULL`, không biến thành 0. Decimal text tối đa bốn chữ số phần thập phân được lưu không dấu phân tách; numeric Excel float chỉ được chấp nhận nếu là số nguyên trong giới hạn biểu diễn chính xác. Raw Excel provenance giữ nguyên trong vùng quản trị. `Ghi Chú` từ Excel là text không tin cậy: Result UI dùng `esc_html`, không render markup/script. Không thêm API, credential, PII hoặc provider call.
+# WP.6H.1A — Payment Fee Semantic Audit Tool
+
+Chỉ admin `manage_options` có nonce mới dùng được AJAX POST để xem hoặc admin-post POST để tải JSON. Cả hai chỉ SELECT `marketplace_order_id`, `payment_raw_data`, `payment_normalized_data`, `payment_fetched_at`, `payment_request_id` cho mã sàn chính xác trong Batch đã chọn. Không có API, refresh token, rematerialization, DB write hay transient chẩn đoán. Bộ chiếu dữ liệu chỉ xuất numeric financial path đã lọc và các normalized key tài chính biết trước; mọi segment mang buyer/recipient/name/phone/email/address/token/sign/credential/secret và các identifier nhạy cảm bị chặn. JSON không chứa full raw snapshot. Download dùng `application/json`, `nosniff`, `no-store`; trình duyệt dựng bảng bằng `textContent`. Công cụ không thuộc quy trình upload thường ngày và không khẳng định mapping `serviceFee` đã đúng.

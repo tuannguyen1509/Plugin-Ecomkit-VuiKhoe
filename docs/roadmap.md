@@ -178,3 +178,99 @@ Runtime `0.5.1`, schema `5`: repair production `Ngày đặt` extraction for Exc
 
 Invalid non-empty dates produce `EXCEL_INVALID_ORDER_DATE`. Missing dates remain unresolved under `SHOPEE_RECON_ORDER_DATE_MISSING`; when no window can be planned, provider calls remain zero, the UI reports `WARNING`, and no green completed notice or false `NOT_FOUND_IN_SHOPEE` is allowed. WP.6 remains blocked until the production re-import and live reconciliation pass.
 
+## WP.6 — Reconciliation Result UI + canonical 24 cột
+
+Trạng thái: **AUTOMATED PASS / MANUAL_REQUIRED**.
+
+Runtime `0.6.0`, schema `6`: mỗi Excel Order có một canonical snapshot `v1` đúng 24 cột trong `orders.canonical_data`. Migration chỉ thêm nullable version/timestamp/fingerprint. Result admin materialize lại local, phát hiện stale, lọc platform/matching và giữ cả Shopee, CANCELLED, missing/detail-missing và Lazada. Payment/Escrow, Lazada API và export chưa triển khai.
+
+WP.7 chỉ được xem xét sau khi WP.6A được kiểm tra thủ công và nguồn của các cột chưa map được quyết định.
+
+## WP.6A — canonical source coverage audit
+
+Runtime `0.6.1`, schema giữ `6`, canonical snapshot `v2`. Kiểm tra đủ 24 cột cho thấy `Mã đơn ESHOP` có nguồn Excel production nhưng WP.6 chưa materialize; parser nay persist field và header provenance cho import mới. Snapshot v1 hiện là stale và operator có thể materialize lại local. Batch cũ thiếu header map chỉ được khôi phục cell D khi đồng thời đáp ứng provenance nghiêm ngặt của workbook production 8 Orders/18 Items đã xác minh; Batch khác để NULL. Các cột tài chính cần Payment/Escrow và các cột chưa có nguồn xác thực vẫn NULL. WP.7 chưa bắt đầu; cần manual review nguồn trước khi xuất.
+
+## WP.6B — Shopee Payment/Escrow foundation
+
+Runtime `0.6.2`, schema `7`, canonical giữ `v2`. Admin chọn một Order Shopee MATCHED từ Batch và bấm kiểm tra; mỗi lần chỉ gửi một `POST /api/v2/payment/get_escrow_detail` với JSON `order_sn` từ `marketplace_order_id`. Không có GET fallback, retry, batch endpoint hay tự động đồng bộ. Validated accounting evidence được lưu riêng trong nullable `payment_raw_data`, `payment_normalized_data`, `payment_fetched_at` (thời điểm lấy, không phải thời điểm provider cập nhật) và `payment_request_id`; migration chỉ thêm cột. Live shop vẫn phải xác nhận POST contract/quyền Payment. Chưa có mapping canonical tài chính, chưa có WP.7. WP.6C cần live evidence và phê duyệt ngữ nghĩa kế toán.
+
+## WP.6C — Shopee financial canonical mapping
+
+Runtime `0.6.3`, schema giữ `7`, canonical `v3`. Live Payment POST đã được xác nhận ngoài giai đoạn code. Action Batch "Cập nhật tài chính Shopee" gọi tối đa một lần cho mỗi Order Shopee MATCHED thiếu snapshot (hoặc mỗi Order khi admin chọn refresh), không gọi cho Lazada; lỗi từng Order độc lập, snapshot cũ được giữ. Sau đó materialize local toàn Batch. `commissionFee`, `serviceFee`, `sellerTransactionFee` map trực tiếp vào ba phí sàn; seller receivable dùng `escrowAmountAfterAdjustment` rồi `escrowAmount`. V1/v2 stale. Các phần trăm, công nợ, đã thu, chênh lệch, affiliate/discount nội bộ vẫn NULL. WP.7 chưa bắt đầu.
+
+## WP.6D — Shopee Income Status foundation
+
+Runtime `0.6.5`, schema `8`, canonical giữ `v3`. Admin chọn một Order Shopee MATCHED, truy vấn PENDING hoặc RELEASED bằng `POST /api/v2/payment/get_income_detail`, so khớp `order_sn` chính xác trên tối đa 10 trang cursor (30 bản ghi/trang theo ví dụ schema). RELEASED dùng cửa sổ payout date tối đa 14 ngày; PENDING bắt buộc gửi hai ngày hợp lệ nhưng hai ngày này **không lọc** record. Chỉ record tìm đúng được lưu ở Income snapshot riêng. Không map Đã Thu Tiền/Trạng Thái Công Nợ, không tự đồng bộ Batch. Cần live shop review trước WP.6E; WP.7 chưa bắt đầu.
+
+## WP.6E — One Upload → Automatic 24-column Result
+
+Runtime `0.6.6`, schema giữ `8`, canonical giữ `v3`. Một upload tự lập lịch Batch pipeline: WP.5 reconciliation/detail, Payment từng Order (snapshot hợp lệ được tái dùng), Income shared-list best-effort, cuối cùng canonical materialization. WP-Cron chia Payment theo từng Order và Income theo từng page/cửa sổ; Result hiển thị tiến độ rồi tự cập nhật. Income HTTP 200 `response:null` là `SHOPEE_INCOME_EMPTY`, không là dữ liệu lỗi hay số 0. Không có cột kế toán mới được map. Cần kiểm tra một file production trên WordPress thật trước khi tuyên bố live PASS; WP.7 chưa bắt đầu.
+
+## WP.6F — Legacy Financial Formula Contract + Giá SP source audit
+
+Runtime `0.6.7`, schema giữ `8`, canonical giữ `v3`. Workbook legacy phê duyệt `% Tổng Chi Phí=(L+M+N+I+J)/F`, `Tổng Tiền Sẽ Thu=F-(L+M+N+I+J)` (chỉ fallback sau Shopee escrow), `% Chiết Khấu Vui Khỏe=(I+J)/F`, `% Chi Phí Sàn TMĐT=(L+M+N)/F`. `Chênh lệch` có `#REF!`, chưa có công thức tin cậy. Production Excel không có `Giá SP (VAT 8%)`, affiliate hoặc discount nội bộ; Order Detail/Payment không chứng minh tương đương. Vì vậy chưa kích hoạt bất kỳ phép tính canonical mới; giữ NULL và one-upload pipeline. Quy ước tương lai: ratio `0.0393=3.93%`, không float/zero-fill/round âm thầm. Cần quyết định nguồn nội bộ, quy tắc multi-item và biểu diễn thập phân trước khi triển khai; WP.7 chưa bắt đầu.
+
+## WP.6E.1 — Automatic Pipeline Progress UX
+
+Runtime `0.6.8`, schema `8`, canonical `v3`. Result có progress card responsive, phần trăm/counters từ persisted Batch state, nhãn tiếng Việt, AJAX admin read-only poll 2,5 giây và cảnh báo Cron sau 90 giây thiếu heartbeat. Trạng thái SUCCESS/WARNING đạt 100% khi Result rows sẵn sàng; Income EMPTY và ô thiếu nguồn không ngăn hoàn tất; hard ERROR không giả 100%. Lịch sử có trạng thái pipeline và tỷ lệ. Không thêm provider API, thay mapping, schema hoặc nút nghiệp vụ. Cần kiểm tra upload thật trên WordPress; WP.7 chưa bắt đầu.
+
+# WP.6H — Exact financial formulas
+
+Plugin 0.7.0 / DB 8 / canonical v5: ba tỷ lệ legacy và fallback Tổng Tiền Sẽ Thu tính tự động từ nguồn Excel nội bộ + Payment đã duyệt, bằng exact decimal-string/rational engine. Snapshot v1–v4 stale; tử số/mẫu số nằm trong canonical JSON, không thêm cột DB/Result. NULL khác 0; zero divisor an toàn; Escrow vẫn ưu tiên; Chênh lệch chưa có công thức. UI phần trăm hiển thị tỷ lệ ×100 với 12 chữ số thập phân tối đa, cắt và ghi `…` khi vô hạn, không sửa canonical. Cần manual one-upload validation; WP.7 chưa bắt đầu.
+
+# WP.6G — Internal Excel sources
+
+Plugin 0.6.9 / DB 8 / canonical v4: năm trường nội bộ tùy chọn được lấy từ cùng workbook Excel, persist Order, materialize trực tiếp; bảy header cũ tiếp tục hợp lệ. Không thêm upload hay thao tác nghiệp vụ. Snapshot v1–v3 cần rematerialize. Ba tỷ lệ và fallback receivable legacy tiếp tục gated cho đến khi có exact decimal arithmetic và chính sách precision; Shopee Escrow không thay đổi. Cần manual WordPress test với workbook mở rộng. WP.7 chưa bắt đầu; Google Sheets/eShop adapter chỉ là lựa chọn tương lai.
+# WP.6H.1A — Safe Payment snapshot audit
+
+Plugin 0.7.1 / DB 8 / canonical v5: thêm công cụ chẩn đoán phí Shopee admin-only trong Kết quả, đọc Payment snapshot đã lưu theo Batch + marketplace order ID chính xác; AJAX POST hiển thị và POST tải JSON projection tài chính an toàn. Không provider call, data mutation hay mapping change. Cần chạy với hai đơn production và gửi lại JSON an toàn để kết thúc audit WP.6H.1; chỉ sau đó cân nhắc WP.6H.2. WP.7 chưa bắt đầu.
+# WP.6H.2 — completed in code; manual WordPress review pending
+
+Plugin 0.7.2 / DB 8 / canonical v6: Shopee Phí dịch vụ legacy được phân loại lại từ `serviceFee + shippingSellerProtectionFeeAmount − discount_vuikhoe` bằng exact math. Thiếu toán hạng = NULL, âm cần review, Escrow ưu tiên, raw/normalized Payment không bị thay đổi. Snapshot v1–v5 stale và rematerialize từ nguồn lưu sẵn, không tự refetch Payment. Một upload tự xử lý; diagnostics dành cho admin và thu gọn. WP.7 chưa bắt đầu.
+
+WP.6H.3B: plugin 0.7.8 / DB 9 / canonical v7. Giá SP lấy Excel trước, kế tiếp Shopee OpenAPI `order_selling_price` đã xác minh cho đơn vàng; giữ discrepancy metadata khi khác nhau. Voucher Xtra không hiện thành trường riêng trong Payment snapshot đã kiểm tra, nên Chiết Khấu VK vẫn chỉ từ Excel. Không dùng Seller Center API riêng, không thêm thao tác cho người dùng, không bắt đầu WP.6I/WP.7.
+
+WP.6H.3C: plugin 0.7.9 / DB 9 / canonical v7. Alias Excel `Voucher Xtra` cung cấp Chiết Khấu VK khi người vận hành có nguồn tin cậy; hai header lệch giá tạo conflict/NULL. Tỷ lệ Result hiển thị 2 chữ số HALF-UP; ratio lưu trữ không đổi. Cần kiểm tra live file có chiết khấu, không suy diễn từ Shopee buyer voucher. WP.6I/WP.7 chưa bắt đầu.
+
+WP.6H.3D: plugin 0.7.10 / DB 9 / canonical v8. Operator duyệt quy tắc hạ tầng Shopee VN 3000 từ serviceFee; fallback Voucher Xtra chỉ khi serviceFee 0 hoặc từ 3000 trở lên, không dùng trạng thái đơn/buyer voucher. Phí dịch vụ = hạ tầng + PiShip. Cần live rematerialize đơn vàng và một đơn hoàn/hủy có serviceFee 0 trước WP.6I/WP.7.
+
+WP.6H.3E: plugin 0.7.11 / DB 9 / canonical v9. Affiliate VK ưu tiên Excel rồi dùng Shopee Payment `affiliateCommissionFee` đúng đơn, kể cả 0; không có Payment = NULL. Tỷ lệ discount/total-cost dùng công thức cũ và formatter HALF-UP 2 chữ số; golden fixture cho 5.50%/29.83%. Cần live rematerialize đơn vàng và kiểm tra đơn hoàn/hủy trước WP.6I/WP.7.
+
+WP.6H.3F: plugin 0.7.12 / DB 9 / canonical v9. Result có hai nút sao chép TSV giá trị thuần (dữ liệu, hoặc dữ liệu + tiêu đề) theo filter hiện tại. Không phải WP.7: chưa có tải CSV/XLSX, lưu file hoặc job export. Cần thử dán vào Excel/Google Sheets đã định dạng để xác nhận định dạng đích được giữ nguyên.
+
+WP.6H.3H: plugin 0.7.13 / DB 9 / canonical v9. Tùy chọn PDF nhãn SPX text-layer chỉ bổ sung tên/địa chỉ cho thao tác copy, không persist PDF/PII; parser giới hạn 5 MiB/50 trang và không OCR. `COMPLETED`/`SHIPPED` có nhãn tiếng Việt đã xác minh; hoàn một phần/toàn phần và hủy trước bàn giao cần nguồn trạng thái chi tiết hơn, nên chưa suy đoán. Chờ kiểm tra live trước WP.6I; WP.7 chưa bắt đầu.
+# WP.6H.2A — automated PASS; manual production review pending
+
+Plugin 0.7.3 / DB 8 / canonical v6. Tự lưu summary an toàn theo từng cửa sổ đối chiếu và phân biệt `SHOPEE_RECON_PROVIDER_WINDOW_EMPTY`, `SHOPEE_RECON_ZERO_INTERSECTION`, `SHOPEE_RECON_PARTIAL_MATCH`; phân trang chưa hoàn tất không tạo kết luận vắng mặt. Result 100% WARNING giải thích zero match và các bước downstream 0/0, tách khỏi source gap Excel. Chỉ sử dụng dữ liệu của lượt đối chiếu sẵn có, không thêm Shopee call, không sửa exact matching hay tài chính. Batch cũ có summary đủ số lượng/trạng thái vẫn có thể hiển thị phân loại tổng quát, nhưng chưa có tập mã theo cửa sổ. WP.7 chưa bắt đầu.
+# WP.6H.2B — deterministic pagination regression fixed; production confirmation pending
+
+Plugin 0.7.4 / DB 8 / canonical v6: WP.6E từng gọi list với giới hạn hai trang, sau đó coi lỗi page-limit là reconciliation terminal và mất tập ID đã đọc. Auto nay persist cursor + ID set giữa các WP-Cron events, không tăng window offset trước khi hoàn tất, rồi mới exact-match và chạy Detail/Payment/Income. Test 11 ID qua 5+5+1 trang PASS, manual/unbounded core parity PASS; lỗi trang chưa hoàn tất vẫn không kết luận NOT_FOUND. Progress không còn báo 11/11 khi matched=missing=0 chưa xử lý. Cần upload lại file lịch sử và xem Batch #22 metadata để xác nhận nguyên nhân live. WP.6I/WP.7 chưa bắt đầu.
+
+# WP.6H.2C — automatic pipeline completion gate; live retest pending
+
+Plugin 0.7.5 / DB 8 / canonical v6: chặn `RESULT_READY` và 100% khi còn đơn Shopee chưa được so sánh đầy đủ mà không có mã chặn cụ thể. Sửa đường lỗi lên lịch Cron từng nhảy thẳng sang materialization; giờ giữ trạng thái chờ và tự lên lịch lại khi mở Result. Kết nối chưa sẵn sàng, nhiều shop, provider lỗi hoặc yêu cầu gián đoạn có mã chặn riêng. Test 11/11, 0/11, canonical sớm, Cron chờ, kết nối chặn và phân trang tiếp tục. Cần thử lại cùng file production và xem metadata Batch #23 để xác định nguyên nhân live; WP.6I/WP.7 chưa bắt đầu.
+
+# WP.6H.2S — safe production state export; evidence pending
+
+Plugin 0.7.6 / DB 8 / canonical v6: admin có thể xuất JSON allowlist của trạng thái Batch, đối chiếu theo cửa sổ, dấu vết request và ảnh chụp kết nối/Cron hiện tại. Không có provider call, ghi business data hay suy diễn trường thiếu. Tiếp theo thu JSON riêng của Batch #23–#25 để định vị nguyên nhân production; chưa triển khai WP.6I/WP.7.
+
+# WP.6H.2T — reconciliation persistence repair; live retest pending
+
+Plugin 0.7.7 / DB 9 / canonical v6: Batch #27 cho thấy lỗi lưu đối chiếu cục bộ. Khóa UNIQUE cũ không cho phép reimport cùng mã sàn/shop qua các Batch; migration không xóa hàng đổi sang khóa theo Batch. Lỗi DB/JSON được phân loại local, chẩn đoán an toàn được giữ riêng, không gắn nhãn provider. Test migration, 10.000 ID metadata và pipeline regression PASS; cần triển khai, xác nhận migration và upload lại đúng một file lịch sử để kết luận live. WP.6I/WP.7 chưa bắt đầu.
+WP.6I: plugin 0.7.14 / DB 9 / canonical v9. Thêm role Ecomkit Operator (`ecomkit_use`), Administrator thêm `ecomkit_manage`; trang chính là Xử lý đơn hàng. Operator thấy Upload, Result, Lịch sử, Lỗi và dùng copy/PDF tạm; Marketplace và mọi công cụ kỹ thuật bị chặn server-side. Pipeline và tính tài chính không đổi. Cần kiểm tra live bằng tài khoản Operator và Administrator trước khi coi FULL PASS; WP.7 chưa bắt đầu.
+WP.6I.1 / 0.7.15: sửa lỗi provisioning chạy quá muộn tại `admin_init`, trước đó WordPress có thể đã từ chối direct URL. Test existing-user cache, menu ordering, additive/idempotent upgrade và technical denial PASS. DB 9/canonical v9 giữ nguyên; chờ Operator/Admin live PASS. WP.7 chưa bắt đầu.
+WP.6I-R / 0.7.16: supersedes the role/capability changes in WP.6I and WP.6I.1. Restore native pre-WP.6I access (`manage_options`); keep UI-only upload/history/errors simplification and Result spacing. No business/schema changes, no role cleanup. Verify deployment with the same previously authorized account. WP.7 not started.
+WP.6J.1 / 0.7.17: Lazada VN foundation only. Encrypted App Key/App Secret configuration, admin Marketplace card, shared pending connection identity, platform isolation tests. DB 9/canonical v9; no calls/OAuth/orders/financial mapping. Next WP.6J.2 Seller Authorization; WP.7 stays blocked until live Lazada integration passes.
+
+WP.6J.2 / 0.7.18: official Lazada seller authorization/token refresh implemented with fake-transport coverage (state/replay/signature/encryption/country/lifecycle/security). No Order/Financial API yet. DB 9/canonical v9; no migration/dependency. Next gate: deploy, configure exact HTTPS callback, authorize real VN seller and confirm ACTIVE/READY + actual safe identity path. Do not start WP.6J.3 until that live gate passes; WP.7 remains blocked.
+
+WP.6J.3A / 0.7.19: user approved automated-only Order client before live OAuth availability. GetOrders/GetOrder/GetOrderItems, signed lifecycle integration, pagination 100/100/37, offset-bound/repetition safety, exact provider DTOs tested with synthetic data. No production Orders persisted or automatic reconciliation/financial mapping. Next WP.6J.3B: real OAuth + live Order validation; only afterward WP.6J.4 exact reconciliation. WP.7 blocked.
+
+WP.6J.3B / 0.7.20: operator confirmed OAuth live ACTIVE/READY. Admin-only Order diagnostic shipped with fake tests; real GetOrders/GetOrder/GetOrderItems are still LIVE PENDING. No business persistence/canonical or financial mapping. Next: deploy, perform 3 live reads and exact Excel-ID pre-check, document safe actual response paths. WP.6J.4 and WP.7 not started.
+
+
+WP.6J.3B.1 / 0.7.21 simplifies only the admin diagnostic: date-only Asia/Ho_Chi_Minh midnight, single exact string ID, one direct GetOrder/GetOrderItems action and optional one-page GetOrders check. Offset and safe evidence are collapsed; independent endpoint results and safe response-error classification. Clients/OAuth/schema/canonical unchanged; no order persistence. Automated real provider calls: 0. Live Order validation pending; WP.6J.4 and WP.7 not started.
+
+WP.6J.3B.3 / 0.7.23: all three seller Order reads now use signed query-string HTTPS GET with unchanged signer, OAuth/refresh and order logic. Operator reports live ACTIVE/READY, app Online and Order Information ACTIVE; reads failed before this patch. Next gate: deploy and retest shop 100070635, date 2026-10-03, exact ID 532935709720247 with list check enabled. Masked PII is allowed. Correct App callback configuration before future reauthorization. WP.6J.4 requires live PASS; WP.7 not started.
+
+WP.6J.4 / 0.7.24: operator confirms OAuth/GetOrder/GetOrderItems/GetOrders FULL PASS live (shop 100070635, exact ID 532935709720247, delivered, MASKED). Exact reconciliation now implemented with direct GetOrder and separate GetOrderItems, existing generic Order evidence, no DB migration, conservative manual chunks/checkpoint, safe errors and no financial/status mapping. Automated fake fixtures and frozen Shopee regressions must pass. Next manual gate: historical Batch reconciliation, verify 1 item/exact ID/raw delivered/masked acceptable, then rerun for idempotence. Validate 529476639104228 independently. WP.6J.5 can start only after live reconciliation FULL PASS; no financial completion claim. WP.6J.6/.7 and WP.7 not started.

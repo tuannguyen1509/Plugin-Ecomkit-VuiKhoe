@@ -72,9 +72,61 @@ try {
 	assert_true( '2026-01-01 03:00:00' === $result['orders'][0]['order_date'] && 3 === $result['raw']['date_column'], 'Named Excel Ngày đặt was not parsed to UTC deterministically.' );
 	assert_true( 'DATETIME' === $result['orders'][0]['order_date_precision'], 'Datetime precision was not retained.' );
 	assert_true( 'TEST-SHP-001' !== 'TEST001' && 'TEST-SHP-001' === $result['orders'][0]['order_code'], 'eShop code was used as identity.' );
+	assert_true( 'TEST001' === $result['orders'][0]['eshop_order_code'] && 4 === $result['raw']['column_map']['Mã đơn hàng eShop'], 'eShop source or header provenance was lost.' );
 	assert_true( 2 === count( $result['orders'][1]['items'] ), 'Continuation row did not attach to one order.' );
+	assert_true( 'TEST002' === $result['orders'][1]['eshop_order_code'], 'Continuation row cleared parent eShop identity.' );
 	assert_true( 'LAZADA' === $result['orders'][2]['platform'] && '000123456789' === $result['orders'][2]['order_code'], 'Lazada leading-zero ID changed.' );
 	assert_true( array() === codes( $result ), 'Valid continuation generated an error.' );
+	foreach ( array( 'product_price_vat_8', 'affiliate_fee_vuikhoe', 'discount_vuikhoe', 'vat_issued_date', 'note' ) as $field ) { assert_true( null === $result['orders'][0][ $field ], "Missing optional $field was not NULL." ); }
+
+	$paths[] = $extended = fixture( static function ( Spreadsheet $book ): void {
+		$sheet = $book->getActiveSheet(); $sheet->setTitle( 'DANH SÁCH ĐƠN HÀNG' );
+		$sheet->setCellValue( 'A1', 'Synthetic report' );
+		$sheet->fromArray( array( 'Ghi Chú', 'Sàn & Mã Đơn', 'Chiết Khấu (Vui Khỏe)', 'Mã hàng hóa', 'Giá SP (VAT 8%)', 'Tên hàng hóa', 'Ngày Xuất VAT', 'Số lg', 'Phí Affiliate (Vui Khỏe)', 'Mã đơn hàng eShop' ), null, 'A4' );
+		$sheet->fromArray( array( 'Đã kiểm tra nội bộ', "Shopee\nTEST-SHP-EXT", 12108, 'SKU-A', 308000, 'Item A', '01/10/2026', 1, 0, 'ĐH001' ), null, 'A5' );
+		$sheet->setCellValue( 'I5', 0 );
+		$sheet->fromArray( array( null, null, null, 'SKU-B', null, 'Item B', null, 2 ), null, 'A6' );
+		$sheet->fromArray( array( null, "Lazada\nTEST-LAZ-EXT", 0, 'SKU-C', '308000.00', 'Item C', null, 1, null, 'ĐH002' ), null, 'A7' );
+		$sheet->setCellValue( 'C7', 0 );
+		$sheet->setCellValueExplicit( 'E7', '308000.00', \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING );
+	} );
+	$extended_result = $parser->parse( $extended );
+	assert_true( 'SUCCESS' === $extended_result['status'] && 4 === $extended_result['raw']['header_row'] && 2 === count( $extended_result['orders'] ), 'Extended header discovery/import failed.' );
+	$first = $extended_result['orders'][0]; $second = $extended_result['orders'][1];
+	assert_true( '308000' === $first['product_price_vat_8'] && '0' === $first['affiliate_fee_vuikhoe'] && '12108' === $first['discount_vuikhoe'], 'Exact internal money parse failed: ' . json_encode( $first, JSON_UNESCAPED_UNICODE ) );
+	assert_true( '2026-10-01 00:00:00' === $first['vat_issued_date'] && 'Đã kiểm tra nội bộ' === $first['note'], 'VAT date/note parse failed.' );
+	assert_true( 2 === count( $first['items'] ) && '308000' === $first['product_price_vat_8'], 'Continuation row overwrote parent internal source.' );
+	assert_true( '308000.00' === $second['product_price_vat_8'] && '0' === $second['discount_vuikhoe'] && null === $second['affiliate_fee_vuikhoe'] && null === $second['vat_issued_date'], 'NULL/zero/decimal precision failed.' );
+	foreach ( array(
+		array( array( 'Chiết Khấu (Vui Khỏe)' ), array( '17160' ), '17160', 'Chiết Khấu (Vui Khỏe)', 'SUCCESS' ),
+		array( array( 'Voucher Xtra' ), array( '17,160' ), '17160', 'Voucher Xtra', 'SUCCESS' ),
+		array( array( 'Chiết Khấu (Vui Khỏe)', 'Voucher Xtra' ), array( '17160.00', '17,160' ), '17160', 'Chiết Khấu (Vui Khỏe)', 'SUCCESS' ),
+		array( array( 'Chiết Khấu (Vui Khỏe)', 'Voucher Xtra' ), array( '17160', '18000' ), null, null, 'WARNING' ),
+		array( array( 'Voucher Xtra' ), array( '0' ), '0', 'Voucher Xtra', 'SUCCESS' ),
+		array( array( 'Voucher Xtra' ), array( '' ), null, null, 'SUCCESS' ),
+		array( array( 'Voucher Xtra' ), array( '-17160' ), null, null, 'WARNING' ),
+	) as [$labels, $values, $expected, $source, $status] ) {
+		$paths[] = $discount_fixture = fixture( static function ( Spreadsheet $book ) use ( $labels, $values ): void {
+			$sheet = $book->getActiveSheet();
+			$sheet->fromArray( array_merge( array( 'Sàn & Mã Đơn', 'Mã hàng hóa', 'Tên hàng hóa', 'Số lg' ), $labels ), null, 'A1' );
+			$sheet->fromArray( array_merge( array( "Shopee\n260924TSBR7FC0", 'SKU-A', 'Item A', 1 ), $values ), null, 'A2' );
+			$sheet->fromArray( array( null, 'SKU-B', 'Item B', 1, 99999, 99999 ), null, 'A3' );
+		} );
+		$parsed_discount = $parser->parse( $discount_fixture );
+		assert_true( $status === $parsed_discount['status'] && 1 === count( $parsed_discount['orders']) && 2 === count( $parsed_discount['orders'][0]['items'] ), 'Discount fixture/order continuation failed.' );
+		assert_true( $expected === $parsed_discount['orders'][0]['discount_vuikhoe'] && $source === $parsed_discount['orders'][0]['discount_vuikhoe_source'], 'Discount source value/alias failed: ' . json_encode( array( $labels, $expected, $source, $parsed_discount['orders'][0]['discount_vuikhoe'], $parsed_discount['orders'][0]['discount_vuikhoe_source'] ), JSON_UNESCAPED_UNICODE ) );
+		if ( 'WARNING' === $status && 2 === count( $labels ) ) { assert_true( in_array( 'DISCOUNT_VUIKHOE_SOURCE_CONFLICT', codes( $parsed_discount ), true ), 'Discount conflict classification missing.' ); }
+		if ( in_array( 'Voucher Xtra', $labels, true ) && array( '-17160' ) === $values ) { assert_true( in_array( 'EXCEL_INVALID_INTERNAL_FIELD', codes( $parsed_discount ), true ), 'Negative Voucher Xtra was accepted.' ); }
+	}
+	$paths[] = $partial_internal = fixture( static function ( Spreadsheet $book ): void { $book->getActiveSheet()->fromArray( array( array( 'Sàn & Mã Đơn', 'Giá SP (VAT 8%)' ), array( "Shopee\nPARTIAL", '24589.50' ) ), null, 'A1' ); $book->getActiveSheet()->setCellValueExplicit( 'B2', '24589.50', \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING ); } );
+	$partial_result = $parser->parse( $partial_internal );
+	assert_true( 'SUCCESS' === $partial_result['status'] && '24589.50' === $partial_result['orders'][0]['product_price_vat_8'] && null === $partial_result['orders'][0]['discount_vuikhoe'], 'Partial optional header failed.' );
+	$paths[] = $bad_internal = fixture( static function ( Spreadsheet $book ): void { $book->getActiveSheet()->fromArray( array( array( 'Sàn & Mã Đơn', 'Giá SP (VAT 8%)' ), array( "Shopee\nBAD-PRICE", 'not-money' ) ), null, 'A1' ); } );
+	$bad_result = $parser->parse( $bad_internal );
+	assert_true( 'WARNING' === $bad_result['status'] && null === $bad_result['orders'][0]['product_price_vat_8'] && 'EXCEL_INVALID_INTERNAL_FIELD' === $bad_result['errors'][0]['error_code'] && 'Giá SP (VAT 8%)' === $bad_result['errors'][0]['field'] && 2 === $bad_result['errors'][0]['row'], 'Invalid internal money was guessed or not tied to row/field.' );
+	$paths[] = $bad_vat = fixture( static function ( Spreadsheet $book ): void { $book->getActiveSheet()->fromArray( array( array( 'Sàn & Mã Đơn', 'Ngày Xuất VAT' ), array( "Shopee\nBAD-VAT", '31/02/2026' ) ), null, 'A1' ); } );
+	$bad_vat_result = $parser->parse( $bad_vat );
+	assert_true( 'WARNING' === $bad_vat_result['status'] && null === $bad_vat_result['orders'][0]['vat_issued_date'] && 'Ngày Xuất VAT' === $bad_vat_result['errors'][0]['field'], 'Invalid VAT date was guessed or not reported.' );
 
 	$paths[] = $date_matrix = fixture( static function ( Spreadsheet $book ): void {
 		$sheet = $book->getActiveSheet();
@@ -172,5 +224,12 @@ try {
 	file_put_contents( $invalid, 'not an xlsx file' );
 	assert_true( 'EXCEL_READ_ERROR' === $parser->parse( $invalid )['errors'][0]['error_code'], 'Invalid workbook was not handled safely.' );
 
+	$paths[] = $lazada_large = fixture( static function ( Spreadsheet $book ): void {
+		$sheet = $book->getActiveSheet();
+		$sheet->fromArray( array( 'STT', 'Sàn & Mã Đơn', 'Ngày đặt', 'Mã đơn hàng eShop', 'Mã hàng hóa', 'Tên hàng hóa', 'Số lg' ), null, 'A1' );
+		$sheet->fromArray( array( 1, "Lazada\n987654321098765432109876543210", '03/10/2026', 'ESHOP-DO-NOT-MATCH', 'SKU', 'Synthetic product', 1 ), null, 'A2' );
+	} );
+	$large_result = $parser->parse( $lazada_large );
+	assert_true( $large_result['orders'][0]['platform'] === 'LAZADA' && $large_result['orders'][0]['order_code'] === '987654321098765432109876543210', 'Large Lazada Excel string ID lost precision.' );
 	echo "WP.2B Excel parser checks passed.\n";
 } finally { foreach ( $paths as $path ) { @unlink( $path ); } }
